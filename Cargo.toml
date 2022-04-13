@@ -6,7 +6,7 @@ keywords = ["udp"]
 authors = ["Nikita Podvirnyy <suimin.tu.mu.ga.mi@gmail.com>"]
 license = "GPL-3.0"
 readme = "README.md"
-repository = "https://github.com/krypt0nn/wait_not_await"
+repository = "https://github.com/krypt0nn/udpsec"
 edition = "2021"
 
 [dependencies]
