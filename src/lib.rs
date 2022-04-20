@@ -1,12 +1,16 @@
 use std::collections::HashMap;
 use std::net::{UdpSocket, SocketAddr};
 use std::io::{ErrorKind, Error};
+use std::time::{Duration, Instant};
+use std::sync::mpsc;
 
 use rand_core::{OsRng, RngCore};
 use x25519_dalek::{PublicKey, ReusableSecret};
+use wait_not_await::Await;
 
 pub use rand_core;
 pub use x25519_dalek;
+pub use wait_not_await;
 
 mod tests;
 
@@ -160,7 +164,7 @@ pub struct Socket {
     addr: SocketAddr,
     socket: UdpSocket,
     secrets: HashMap<SocketAddr, [u8; 32]>,
-    floating_connections: HashMap<SocketAddr, ReusableSecret>,
+    floating_connections: HashMap<SocketAddr, (ReusableSecret, mpsc::Sender<()>)>,
 
     /// Datagrams encoder
     pub encoder: Box<dyn Fn(Vec<u8>, &[u8; 32]) -> Vec<u8>>,
@@ -245,21 +249,37 @@ impl Socket {
     /// let mut socket_a = Socket::new(local_addr).unwrap();
     /// let mut socket_b = Socket::new(remote_addr).unwrap();
     /// 
-    /// socket_a.generate_secret(remote_addr);
+    /// // wait_not_await's Await
+    /// socket_a.generate_secret(remote_addr).unwrap().then(|ping| {
+    ///     println!("Ping: {} ms", ping.as_millis());
+    /// });
     /// 
     /// socket_b.recv(); // Remote client updates its state in a loop
     /// 
-    /// while let None = socket_a.shared_secret(remote_addr) {
+    /// while socket_a.shared_secret(remote_addr) == None {
     ///     socket_a.recv();
     /// }
     /// 
     /// println!("Shared secret (local): {:?}", socket_a.shared_secret(remote_addr).unwrap());
     /// println!("Shared secret (remote): {:?}", socket_b.shared_secret(local_addr).unwrap());
     /// ```
-    pub fn generate_secret(&mut self, addr: SocketAddr) -> Result<usize, Error> {
-        self.floating_connections.insert(addr, ReusableSecret::new(OsRng));
+    pub fn generate_secret(&mut self, addr: SocketAddr) -> Result<Await<Duration>, Error> {
+        let (sender, receiver) = mpsc::channel::<()>();
 
-        self.write(addr, Packet::KeyExchangeInit(PublicKey::from(self.floating_connections.get(&addr).unwrap())))
+        self.floating_connections.insert(addr, (ReusableSecret::new(OsRng), sender));
+
+        match self.write(addr, Packet::KeyExchangeInit(PublicKey::from(&self.floating_connections.get(&addr).unwrap().0))) {
+            Ok(_) => {
+                let instant = Instant::now();
+
+                Ok(Await::new(move || {
+                    receiver.recv();
+
+                    instant.elapsed()
+                }))
+            },
+            Err(err) => Err(err)
+        }
     }
 
     /// Get shared secret with a specified remote address
@@ -323,8 +343,10 @@ impl Socket {
                     }
 
                     Packet::KeyExchangeDone(public_key) => {
-                        if let Some(secret) = self.floating_connections.get(&from) {
+                        if let Some((secret, sender)) = self.floating_connections.get(&from) {
                             self.secrets.insert(from, *secret.diffie_hellman(&public_key).as_bytes());
+
+                            sender.send(());
                             
                             self.floating_connections.remove(&from);
                         }
@@ -332,21 +354,40 @@ impl Socket {
                         None
                     }
 
-                    Packet::Datagram(mut data) => {
-                        match self.secrets.get(&from) {
-                            Some(secret) => {
-                                data = (self.decoder)(data, secret);
+                    Packet::Datagram(data) => {
+                        // If we have secret key - try to decode data
+                        if let Some(secret) = self.secrets.get(&from) {
+                            let decoded = (self.decoder)(data.clone(), secret);
 
-                                if get_checksum(&data[4..]) == &data[0..4] {
-                                    Some((from, data[4..].to_vec()))
-                                }
-
-                                else {
-                                    None
-                                }
-                            },
-                            None => None
+                            if get_checksum(&decoded[4..]) == &decoded[0..4] {
+                                return Some((from, decoded[4..].to_vec()))
+                            }
                         }
+
+                        // Otherwise let's check all the others secrets and mb there'll be what we need
+                        // The problem is that if client will change its IP address for some reason - it'll
+                        // use already generated shared secret while we'll not know it. So we need to check
+                        // all the connected clients and move secret from one to another if it'll decode data correctly
+                        let mut found = None;
+
+                        for (remote, shared) in &self.secrets {
+                            let decoded = (self.decoder)(data.clone(), &shared);
+
+                            if get_checksum(&decoded[4..]) == &decoded[0..4] {
+                                found = Some((decoded[4..].to_vec(), remote.clone(), shared.clone()));
+
+                                break;
+                            }
+                        }
+
+                        if let Some((decoded, remote, shared)) = found {
+                            self.secrets.remove(&remote);
+                            self.secrets.insert(from, shared.clone());
+
+                            return Some((from, decoded));
+                        }
+
+                        None
                     }
                 }
             },

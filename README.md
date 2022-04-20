@@ -30,12 +30,15 @@ fn main() {
     let mut socket = Socket::new(local_addr).unwrap();
 
     // Send shared secret generation request
-    socket.generate_secret(remote_addr).unwrap();
+    let mut awaiter = socket.generate_secret(remote_addr).unwrap();
 
     // Wait until it'll not be generated
     while let None = socket.shared_secret(remote_addr) {
         socket.recv();
     }
+
+    // wait because sometimes result can return None
+    println!("Ping: {} ms", awaiter.wait(None).unwrap().as_millis());
 
     // Input and send text
     loop {
